@@ -172,6 +172,53 @@ describe("HTTP mobile composition", () => {
     expect(ledgerHeaders.get("x-internal-service-token")).toBeNull();
   });
 
+  it("surfaces Ledger's error code when the wallet balance call fails", async () => {
+    fetchMock.mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          code: "CUSTOMER_WALLET_NOT_FOUND",
+          message: "Customer wallet account not found",
+        }),
+        { status: 404, headers: { "content-type": "application/json" } },
+      ),
+    );
+    await expect(
+      new HttpMobileComposition(config, tokens).wallet({
+        tenantId: randomUUID(),
+        customerId: randomUUID(),
+        authorization: "Bearer customer-token",
+        correlationId: randomUUID(),
+      }),
+    ).rejects.toMatchObject({
+      name: "DownstreamError",
+      status: 404,
+      code: "CUSTOMER_WALLET_NOT_FOUND",
+    });
+  });
+
+  it("applies a per-route timeout to the downstream call", async () => {
+    const timeout = jest.spyOn(AbortSignal, "timeout");
+    fetchMock.mockResolvedValue(
+      new Response("{}", {
+        status: 202,
+        headers: { "content-type": "application/json" },
+      }),
+    );
+    await new HttpMobileComposition(config, tokens).relay({
+      service: "auth-customer",
+      method: "POST",
+      path: "/v1/onboarding/identity",
+      query: new URLSearchParams(),
+      body: {},
+      tenantId: randomUUID(),
+      authorization: "Bearer customer-token",
+      correlationId: randomUUID(),
+      timeoutMs: 50_000,
+    });
+    expect(timeout).toHaveBeenLastCalledWith(50_000);
+    timeout.mockRestore();
+  });
+
   it("relays an allowlisted command without leaking internal credentials", async () => {
     fetchMock.mockResolvedValue(
       new Response(JSON.stringify({ status: "accepted" }), {

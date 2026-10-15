@@ -10,7 +10,7 @@ import type {
   CustomerAuthenticator,
   CustomerPrincipal,
 } from "./authenticator.js";
-import type { MobileComposition } from "./composition.js";
+import { DownstreamError, type MobileComposition } from "./composition.js";
 
 type RelayRoute = {
   method: "get" | "post" | "patch" | "put" | "delete";
@@ -24,7 +24,14 @@ type RelayRoute = {
     | "tenant-admin";
   downstreamPath: (request: Request) => string;
   internal?: boolean;
+  timeoutMs?: number;
 };
+
+/**
+ * NIN lookup and the liveness + face match wait on the KYC provider (up to
+ * two provider calls in Auth), which the default downstream timeout cuts off.
+ */
+const KYC_TIMEOUT_MS = 50_000;
 
 const relayRoutes: RelayRoute[] = [
   {
@@ -74,12 +81,14 @@ const relayRoutes: RelayRoute[] = [
     publicPath: "/v1/onboarding/identity",
     service: "auth-customer",
     downstreamPath: () => "/v1/onboarding/identity",
+    timeoutMs: KYC_TIMEOUT_MS,
   },
   {
     method: "post",
     publicPath: "/v1/onboarding/face-verification",
     service: "auth-customer",
     downstreamPath: () => "/v1/onboarding/face-verification",
+    timeoutMs: KYC_TIMEOUT_MS,
   },
   {
     method: "post",
@@ -484,6 +493,33 @@ export function createApp(
   const app = express();
   app.disable("x-powered-by");
   app.use(helmet());
+  // Paystack's public webhook entry point (the gateway publishes only the
+  // BFFs). Registered before the JSON parser and authentication: Payment
+  // verifies the HMAC over the exact raw bytes, so they pass through untouched.
+  const relayPaystackWebhook =
+    composition.relayPaystackWebhook?.bind(composition);
+  if (relayPaystackWebhook)
+    app.post(
+      "/v1/webhooks/paystack",
+      express.raw({ type: () => true, limit: "256kb" }),
+      async (request, response) => {
+        const signature = request.header("x-paystack-signature");
+        if (!Buffer.isBuffer(request.body) || !signature) {
+          response.status(400).json({ code: "INVALID_WEBHOOK" });
+          return;
+        }
+        try {
+          const result = await relayPaystackWebhook({
+            body: request.body,
+            signature,
+          });
+          response.status(result.status).json(result.body);
+        } catch {
+          // Non-2xx makes Paystack retry later.
+          response.status(502).json({ code: "DEPENDENCY_UNAVAILABLE" });
+        }
+      },
+    );
   app.use(express.json({ limit: "2mb" }));
   app.use((request, response, next) => {
     const supplied = request.header("x-correlation-id");
@@ -612,6 +648,62 @@ export function createApp(
       next(error);
     }
   });
+  // Opens the customer's Paystack account number. The client sends only bank
+  // details (plus a BVN when none is on file); the Ledger wallet it funds is resolved here, server
+  // side, so a client can never point the account at someone else's wallet.
+  app.post("/v1/wallet/virtual-account", async (request, response, next) => {
+    try {
+      const principal = request.principal;
+      const authorization = request.header("authorization");
+      if (!principal || !authorization)
+        throw new Error("Authenticated customer context is unavailable");
+      const body = z
+        .object({
+          // Optional: Payment uses the BVN verified at onboarding when on file.
+          bvn: z
+            .string()
+            .regex(/^[0-9]{11}$/)
+            .optional(),
+          bank_code: z.string().regex(/^[0-9A-Za-z]{3,20}$/),
+          account_number: z.string().regex(/^[0-9]{10}$/),
+        })
+        .strict()
+        .parse(request.body);
+      const idempotencyKey = z
+        .string()
+        .min(1)
+        .max(255)
+        .parse(request.header("idempotency-key"));
+      const context = {
+        tenantId: principal.tenantId,
+        authorization,
+        correlationId: correlationId(request),
+      };
+      const customerId = await composition.customerProfileId(context);
+      const wallet = await composition.wallet({
+        ...principal,
+        ...context,
+        customerId,
+      });
+      const result = await composition.relay({
+        service: "payment",
+        method: "POST",
+        path: "/v1/wallet/virtual-account",
+        query: new URLSearchParams(),
+        body: { ...body, ledger_account_id: wallet.source_account_id },
+        tenantId: principal.tenantId,
+        authorization,
+        correlationId: correlationId(request),
+        idempotencyKey,
+        timeoutMs: 30_000,
+      });
+      if (result.contentType)
+        response.setHeader("content-type", result.contentType);
+      response.status(result.status).send(result.body);
+    } catch (error) {
+      next(error);
+    }
+  });
   app.get("/v1/dashboard", async (request, response, next) => {
     try {
       const principal = request.principal;
@@ -634,8 +726,13 @@ export function createApp(
         composition.section({ ...context, name: "loans" }),
         composition.section({ ...context, name: "savings" }),
       ]);
-      if (wallet.status === "rejected")
-        throw new Error("Wallet balance unavailable");
+      if (wallet.status === "rejected") throw wallet.reason;
+      for (const [name, section] of [
+        ["loans", loans],
+        ["savings", savings],
+      ] as const)
+        if (section.status === "rejected")
+          logFailure(request, section.reason, `dashboard ${name} section`);
       response.json({
         wallet: wallet.value,
         sections: {
@@ -690,6 +787,7 @@ export function createApp(
           correlationId: correlationId(request),
           ...(idempotencyKey ? { idempotencyKey } : {}),
           ...(route.internal ? { internal: true } : {}),
+          ...(route.timeoutMs ? { timeoutMs: route.timeoutMs } : {}),
         });
         if (result.contentType)
           response.setHeader("content-type", result.contentType);
@@ -715,6 +813,19 @@ export function createApp(
       _next: NextFunction,
     ) => {
       const invalid = error instanceof z.ZodError;
+      if (!invalid) logFailure(request, error);
+      if (
+        error instanceof DownstreamError &&
+        error.code === "CUSTOMER_WALLET_NOT_FOUND"
+      ) {
+        response.status(503).json({
+          code: "WALLET_NOT_PROVISIONED",
+          message: "Your wallet is still being set up",
+          correlation_id: request.correlationId,
+          retryable: true,
+        });
+        return;
+      }
       response.status(invalid ? 422 : 502).json({
         code: invalid ? "INVALID_REQUEST" : "DEPENDENCY_UNAVAILABLE",
         message: invalid
@@ -754,6 +865,31 @@ function authenticate(authenticator: CustomerAuthenticator) {
       });
     }
   };
+}
+
+/**
+ * One JSON line per failure so the cause behind a generic
+ * DEPENDENCY_UNAVAILABLE can be found by correlation id. Never logs
+ * headers or bodies, only the error and the downstream status/code.
+ */
+function logFailure(request: Request, error: unknown, context?: string): void {
+  console.error(
+    JSON.stringify({
+      level: "error",
+      msg: context ? `${context} failed` : "Request failed",
+      correlation_id: request.correlationId,
+      method: request.method,
+      path: request.path,
+      error: error instanceof Error ? error.message : String(error),
+      ...(error instanceof DownstreamError
+        ? {
+            downstream: error.target,
+            downstream_status: error.status,
+            downstream_code: error.code,
+          }
+        : {}),
+    }),
+  );
 }
 
 function correlationId(request: Request): string {

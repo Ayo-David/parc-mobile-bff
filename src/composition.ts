@@ -1,3 +1,19 @@
+/**
+ * A downstream service answered with a non-2xx status. `code` is the
+ * service's own error code when its body carried one, e.g. Ledger's
+ * CUSTOMER_WALLET_NOT_FOUND.
+ */
+export class DownstreamError extends Error {
+  public constructor(
+    public readonly target: string,
+    public readonly status: number,
+    public readonly code: string | null,
+  ) {
+    super(`${target} responded ${String(status)}${code ? ` ${code}` : ""}`);
+    this.name = "DownstreamError";
+  }
+}
+
 export interface Money {
   amount_minor: string;
   currency: "NGN";
@@ -46,6 +62,8 @@ export interface RelayRequest {
   correlationId: string;
   idempotencyKey?: string;
   internal?: boolean;
+  /** Overrides DOWNSTREAM_TIMEOUT_MS for routes that wait on external providers. */
+  timeoutMs?: number;
 }
 export interface RelayResponse {
   status: number;
@@ -88,4 +106,12 @@ export interface MobileComposition {
     correlationId: string;
   }): Promise<{ eligible_products: unknown; loans: unknown }>;
   ready(): Promise<boolean>;
+  /**
+   * Forwards a Paystack webhook to Payment byte-for-byte with its signature;
+   * Payment verifies the HMAC. Optional so test doubles can omit it.
+   */
+  relayPaystackWebhook?(input: {
+    body: Buffer;
+    signature: string;
+  }): Promise<{ status: number; body: unknown }>;
 }
