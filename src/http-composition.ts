@@ -1,13 +1,14 @@
 import { z } from "zod";
 import type { MobileBffConfig } from "./config.js";
 import type { ParcTokenClient } from "./security/parc-service-auth.js";
-import type {
-  BootstrapResult,
-  MobileComposition,
-  Money,
-  OnboardingReferenceData,
-  RelayRequest,
-  RelayResponse,
+import {
+  DownstreamError,
+  type BootstrapResult,
+  type MobileComposition,
+  type Money,
+  type OnboardingReferenceData,
+  type RelayRequest,
+  type RelayResponse,
 } from "./composition.js";
 
 const bootstrap = z.object({
@@ -245,6 +246,28 @@ export class HttpMobileComposition implements MobileComposition {
     });
   }
 
+  public async relayPaystackWebhook(input: {
+    body: Buffer;
+    signature: string;
+  }): Promise<{ status: number; body: unknown }> {
+    const response = await fetch(
+      new URL("/v1/webhooks/paystack", this.config.PAYMENT_URL),
+      {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-paystack-signature": input.signature,
+        },
+        body: new Uint8Array(input.body),
+        signal: AbortSignal.timeout(this.config.DOWNSTREAM_TIMEOUT_MS * 3),
+      },
+    );
+    return {
+      status: response.status,
+      body: await response.json().catch(() => ({})),
+    };
+  }
+
   public async relay(input: RelayRequest): Promise<RelayResponse> {
     const origins = {
       "auth-customer": this.config.AUTH_CUSTOMER_URL,
@@ -287,7 +310,9 @@ export class HttpMobileComposition implements MobileComposition {
         ...(input.internal ? { "x-calling-service": "parc-mobile-bff" } : {}),
       },
       ...(serializedBody === undefined ? {} : { body: serializedBody }),
-      signal: AbortSignal.timeout(this.config.DOWNSTREAM_TIMEOUT_MS),
+      signal: AbortSignal.timeout(
+        input.timeoutMs ?? this.config.DOWNSTREAM_TIMEOUT_MS,
+      ),
     });
     const contentType = response.headers.get("content-type") ?? undefined;
     const body: unknown = contentType?.includes("application/json")
@@ -350,10 +375,15 @@ export class HttpMobileComposition implements MobileComposition {
       headers: { accept: "application/json", ...headers },
       signal: AbortSignal.timeout(this.config.DOWNSTREAM_TIMEOUT_MS),
     });
-    if (!response.ok)
-      throw new Error(
-        `Downstream request failed with status ${String(response.status)}`,
+    if (!response.ok) {
+      const body: unknown = await response.json().catch(() => null);
+      const code = z.object({ code: z.string() }).safeParse(body);
+      throw new DownstreamError(
+        `GET ${url.host}${url.pathname}`,
+        response.status,
+        code.success ? code.data.code : null,
       );
+    }
     return response.json();
   }
 }

@@ -3,7 +3,11 @@ import { jest } from "@jest/globals";
 import request from "supertest";
 import { createApp } from "../src/app.js";
 import type { CustomerAuthenticator } from "../src/authenticator.js";
-import type { MobileComposition } from "../src/composition.js";
+import {
+  DownstreamError,
+  type MobileComposition,
+  type RelayRequest,
+} from "../src/composition.js";
 
 const tenantId = randomUUID();
 const customerId = randomUUID();
@@ -115,6 +119,149 @@ describe("Mobile BFF foundation", () => {
     });
   });
 
+  it("reports a wallet Ledger hasn't provisioned yet as retryable WALLET_NOT_PROVISIONED", async () => {
+    const log = jest
+      .spyOn(console, "error")
+      .mockImplementation(() => undefined);
+    const unprovisioned: MobileComposition = {
+      ...composition,
+      wallet: () =>
+        Promise.reject(
+          new DownstreamError(
+            "GET ledger/internal/v1/customers/x/wallet-balance",
+            404,
+            "CUSTOMER_WALLET_NOT_FOUND",
+          ),
+        ),
+    };
+    const response = await request(createApp(authenticator, unprovisioned))
+      .get("/v1/dashboard")
+      .set("authorization", "Bearer test")
+      .set("x-tenant-id", tenantId);
+    const logged = JSON.parse(String(log.mock.calls[0]?.[0])) as Record<
+      string,
+      unknown
+    >;
+    log.mockRestore();
+    expect(response.status).toBe(503);
+    expect(response.body).toMatchObject({
+      code: "WALLET_NOT_PROVISIONED",
+      retryable: true,
+    });
+    expect(logged).toMatchObject({
+      path: "/v1/dashboard",
+      downstream_status: 404,
+      downstream_code: "CUSTOMER_WALLET_NOT_FOUND",
+    });
+  });
+
+  it("logs the cause behind a generic dependency failure", async () => {
+    const log = jest
+      .spyOn(console, "error")
+      .mockImplementation(() => undefined);
+    const failing: MobileComposition = {
+      ...composition,
+      wallet: () =>
+        Promise.reject(new DownstreamError("GET ledger/x", 500, null)),
+    };
+    const response = await request(createApp(authenticator, failing))
+      .get("/v1/dashboard")
+      .set("authorization", "Bearer test")
+      .set("x-tenant-id", tenantId);
+    const logged = String(log.mock.calls[0]?.[0]);
+    log.mockRestore();
+    expect(response.status).toBe(502);
+    expect(response.body).toMatchObject({ code: "DEPENDENCY_UNAVAILABLE" });
+    expect(logged).toContain('"downstream_status":500');
+  });
+
+  it("opens the account number against the wallet resolved server side", async () => {
+    const relay = jest.fn(() =>
+      Promise.resolve({ status: 202, body: { status: "PENDING" } }),
+    );
+    const response = await request(
+      createApp(authenticator, { ...composition, relay }),
+    )
+      .post("/v1/wallet/virtual-account")
+      .set("authorization", "Bearer test")
+      .set("x-tenant-id", tenantId)
+      .set("idempotency-key", "va-1")
+      .send({
+        bvn: "22222222222",
+        bank_code: "058",
+        account_number: "0123456789",
+      });
+    expect(response.status).toBe(202);
+    expect(relay).toHaveBeenCalledWith(
+      expect.objectContaining({
+        service: "payment",
+        method: "POST",
+        path: "/v1/wallet/virtual-account",
+        idempotencyKey: "va-1",
+        body: {
+          bvn: "22222222222",
+          bank_code: "058",
+          account_number: "0123456789",
+          ledger_account_id: walletAccountId,
+        },
+      }),
+    );
+  });
+
+  it("refuses a client-supplied wallet on the account-number request", async () => {
+    const relay = jest.fn(() => Promise.resolve({ status: 202, body: {} }));
+    const response = await request(
+      createApp(authenticator, { ...composition, relay }),
+    )
+      .post("/v1/wallet/virtual-account")
+      .set("authorization", "Bearer test")
+      .set("x-tenant-id", tenantId)
+      .set("idempotency-key", "va-2")
+      .send({
+        bvn: "22222222222",
+        bank_code: "058",
+        account_number: "0123456789",
+        ledger_account_id: randomUUID(),
+      });
+    expect(response.status).toBe(422);
+    expect(relay).not.toHaveBeenCalled();
+  });
+
+  it("relays Paystack webhooks to Payment byte-for-byte without customer auth", async () => {
+    const relayPaystackWebhook = jest.fn(() =>
+      Promise.resolve({ status: 202, body: { webhook_id: "w-1" } }),
+    );
+    const raw = '{"event":"charge.success",  "data":{"amount":250000}}';
+    const response = await request(
+      createApp(authenticator, { ...composition, relayPaystackWebhook }),
+    )
+      .post("/v1/webhooks/paystack")
+      .set("content-type", "application/json")
+      .set("x-paystack-signature", "f".repeat(128))
+      .send(raw);
+    expect(response.status).toBe(202);
+    const forwarded = relayPaystackWebhook.mock.calls[0] as unknown as [
+      { body: Buffer; signature: string },
+    ];
+    // Exact bytes, including the double space: the HMAC is over the raw body.
+    expect(forwarded[0].body.toString("utf8")).toBe(raw);
+    expect(forwarded[0].signature).toBe("f".repeat(128));
+  });
+
+  it("rejects an unsigned Paystack webhook before relaying it", async () => {
+    const relayPaystackWebhook = jest.fn(() =>
+      Promise.resolve({ status: 202, body: {} }),
+    );
+    const response = await request(
+      createApp(authenticator, { ...composition, relayPaystackWebhook }),
+    )
+      .post("/v1/webhooks/paystack")
+      .set("content-type", "application/json")
+      .send("{}");
+    expect(response.status).toBe(400);
+    expect(relayPaystackWebhook).not.toHaveBeenCalled();
+  });
+
   it("returns the authenticated customer's Ledger wallet source account", async () => {
     const response = await request(app)
       .get("/v1/wallet/source-account")
@@ -195,6 +342,46 @@ describe("Mobile BFF foundation", () => {
         idempotencyKey: "mobile-bill-1",
       }),
     );
+  });
+
+  it("gives KYC onboarding steps a longer downstream timeout and room for a selfie", async () => {
+    const relay = jest.fn((_input: RelayRequest) =>
+      Promise.resolve({ status: 202, body: { status: "accepted" } }),
+    );
+    const app = createApp(authenticator, { ...composition, relay });
+    const selfie = "/9j/" + "A".repeat(1_400_000);
+    const face = await request(app)
+      .post("/v1/onboarding/face-verification")
+      .set("authorization", "Bearer test")
+      .set("x-tenant-id", tenantId)
+      .set("idempotency-key", "face-1")
+      .send({
+        identity_type: "NIN",
+        identity_value: "10000000001",
+        selfie_image: selfie,
+        consent_id: randomUUID(),
+      });
+    expect(face.status).toBe(202);
+    const faceRelay = relay.mock.calls.at(-1)?.[0];
+    expect(faceRelay).toMatchObject({
+      path: "/v1/onboarding/face-verification",
+      idempotencyKey: "face-1",
+      timeoutMs: 50_000,
+    });
+    expect((faceRelay?.body as { selfie_image?: string }).selfie_image).toBe(
+      selfie,
+    );
+    await request(app)
+      .put("/v1/onboarding/address")
+      .set("authorization", "Bearer test")
+      .set("x-tenant-id", tenantId)
+      .set("idempotency-key", "address-1")
+      .send({});
+    const addressRelay = relay.mock.calls.at(
+      -1,
+    )?.[0] as unknown as RelayRequest;
+    expect(addressRelay.path).toBe("/v1/onboarding/address");
+    expect(addressRelay.timeoutMs).toBeUndefined();
   });
 
   it("exposes the authenticated customer's money-movement source account", async () => {
