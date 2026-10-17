@@ -354,14 +354,17 @@ export class HttpMobileComposition implements MobileComposition {
   }
 
   public async ready(): Promise<boolean> {
-    const origins = [
-      this.config.TENANT_ADMIN_URL,
-      this.config.LEDGER_URL,
-      this.config.LENDING_URL,
-      this.config.SAVINGS_URL,
+    const probes = [
+      new URL("/health", this.config.TENANT_ADMIN_URL),
+      new URL("/health", this.config.LEDGER_URL),
+      new URL("/health", this.config.LENDING_URL),
+      new URL("/health", this.config.SAVINGS_URL),
+      // Every downstream call needs a service token, so the issuer's own
+      // readiness (database and a writable Redis) gates ours.
+      new URL("/ready", this.config.AUTH_CUSTOMER_URL),
     ];
     const results = await Promise.allSettled(
-      origins.map((origin) => this.request(new URL("/health", origin), {})),
+      probes.map((url) => this.request(url, {})),
     );
     return results.every((result) => result.status === "fulfilled");
   }

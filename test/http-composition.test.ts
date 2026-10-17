@@ -87,6 +87,27 @@ describe("HTTP mobile composition", () => {
     ).rejects.toThrow("Customer profile tenant mismatch");
   });
 
+  it("is not ready while the service token issuer is not ready", async () => {
+    fetchMock.mockImplementation((input) =>
+      Promise.resolve(
+        new Response(null, {
+          status: (input instanceof Request
+            ? input.url
+            : input.toString()
+          ).startsWith("http://auth.internal/")
+            ? 503
+            : 200,
+        }),
+      ),
+    );
+    const composition = new HttpMobileComposition(config, tokens);
+    await expect(composition.ready()).resolves.toBe(false);
+    expect(fetchMock).toHaveBeenCalledWith(
+      new URL("http://auth.internal/ready"),
+      expect.anything(),
+    );
+  });
+
   it("resolves bootstrap using authenticated private Tenant Admin headers", async () => {
     const tenantId = randomUUID();
     fetchMock.mockResolvedValue(

@@ -18,17 +18,18 @@ const authenticate = jest.fn(() =>
 const authenticator: CustomerAuthenticator = {
   authenticate,
 };
+const bootstrap = jest.fn<MobileComposition["bootstrap"]>(() =>
+  Promise.resolve({
+    tenant_id: tenantId,
+    minimum_supported_version: "1.0.0",
+    maintenance: false,
+    features: { savings: true },
+  }),
+);
 const composition: MobileComposition = {
   customerProfileId: jest.fn(() => Promise.resolve(customerId)),
   ready: jest.fn(() => Promise.resolve(true)),
-  bootstrap: jest.fn(() =>
-    Promise.resolve({
-      tenant_id: tenantId,
-      minimum_supported_version: "1.0.0",
-      maintenance: false,
-      features: { savings: true },
-    }),
-  ),
+  bootstrap,
   onboardingReferenceData: jest.fn(() =>
     Promise.resolve({
       consent_documents: [],
@@ -68,6 +69,41 @@ describe("Mobile BFF foundation", () => {
       maintenance: false,
     });
     expect(authenticate).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    [404, "TENANT_NOT_FOUND"],
+    [426, "APP_UPGRADE_REQUIRED"],
+  ])(
+    "passes Tenant Admin's %i %s bootstrap verdict through as non-retryable",
+    async (status, code) => {
+      bootstrap.mockRejectedValueOnce(
+        new DownstreamError(
+          "GET tenant-admin/internal/v1/mobile/bootstrap",
+          status,
+          code,
+        ),
+      );
+      const response = await request(app)
+        .get("/v1/bootstrap?app_version=1.0.0&platform=android")
+        .set("x-tenant-slug", "demo-bank");
+      expect(response.status).toBe(status);
+      expect(response.body).toMatchObject({ code, retryable: false });
+    },
+  );
+
+  it("keeps other bootstrap failures as a retryable 502", async () => {
+    bootstrap.mockRejectedValueOnce(
+      new Error("Service token request failed (500 server_error)"),
+    );
+    const response = await request(app)
+      .get("/v1/bootstrap?app_version=1.0.0&platform=android")
+      .set("x-tenant-slug", "demo-bank");
+    expect(response.status).toBe(502);
+    expect(response.body).toMatchObject({
+      code: "DEPENDENCY_UNAVAILABLE",
+      retryable: true,
+    });
   });
 
   it("serves onboarding reference data without a customer session", async () => {
@@ -472,6 +508,29 @@ describe("Mobile BFF foundation", () => {
         tenantId,
         authorization: "Bearer test",
         idempotencyKey: "beneficiary-1",
+      }),
+    );
+  });
+
+  it("relays a customer transfer to Payment's bank transfer command", async () => {
+    const relay = jest.fn(() =>
+      Promise.resolve({ status: 202, body: { id: randomUUID() } }),
+    );
+    const response = await request(
+      createApp(authenticator, { ...composition, relay }),
+    )
+      .post("/v1/transfers")
+      .set("authorization", "Bearer test")
+      .set("x-tenant-id", tenantId)
+      .set("idempotency-key", "transfer-1")
+      .send({ quote_id: randomUUID(), bank_code: "058" });
+    expect(response.status).toBe(202);
+    expect(relay).toHaveBeenCalledWith(
+      expect.objectContaining({
+        service: "payment",
+        method: "POST",
+        path: "/v1/transfers/bank",
+        idempotencyKey: "transfer-1",
       }),
     );
   });

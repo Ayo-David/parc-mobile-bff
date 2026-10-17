@@ -200,7 +200,8 @@ const relayRoutes: RelayRoute[] = [
     method: "post",
     publicPath: "/v1/transfers",
     service: "payment",
-    downstreamPath: () => "/v1/transfers",
+    // Customer transfers leave the platform; Payment's bank transfer command.
+    downstreamPath: () => "/v1/transfers/bank",
   },
   {
     method: "get",
@@ -560,6 +561,19 @@ export function createApp(
         }),
       );
     } catch (error) {
+      // Tenant Admin's verdicts are final for this app install; surfacing them
+      // as a retryable 502 would leave the app retrying forever.
+      const code = error instanceof DownstreamError ? error.code : null;
+      const rejection = code ? bootstrapRejections[code] : undefined;
+      if (code && rejection) {
+        response.status(rejection.status).json({
+          code,
+          message: rejection.message,
+          correlation_id: request.correlationId,
+          retryable: false,
+        });
+        return;
+      }
       next(error);
     }
   });
@@ -838,6 +852,17 @@ export function createApp(
   );
   return app;
 }
+
+const bootstrapRejections: Record<
+  string,
+  { status: number; message: string } | undefined
+> = {
+  TENANT_NOT_FOUND: { status: 404, message: "Tenant was not found" },
+  APP_UPGRADE_REQUIRED: {
+    status: 426,
+    message: "Mobile application upgrade is required",
+  },
+};
 
 function authenticate(authenticator: CustomerAuthenticator) {
   return async (request: Request, response: Response, next: NextFunction) => {
